@@ -2,6 +2,8 @@
 
 OST is a colorful terminal UI for exploring local disks, files, network connections, processes, CPU, memory, services, logs, and system metadata. It starts with a visual dashboard for a quick system overview.
 
+![OST dashboard](img/ost-dashboard.png)
+
 ## Run
 
 ```bash
