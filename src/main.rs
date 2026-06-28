@@ -4,6 +4,8 @@ use std::{
     io::{self, Stdout, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -34,6 +36,8 @@ const VIEWS: [View; 9] = [
     View::System,
 ];
 const FAST_SELECTION_STEP: isize = 5;
+const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+const NETWORK_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 
 fn main() -> io::Result<()> {
     let mut terminal = setup_terminal()?;
@@ -248,23 +252,36 @@ struct App {
     prompt_text: String,
     search: String,
     last_refresh: Instant,
+    last_network_refresh: Instant,
+    initial_load_started: bool,
+    network_loading: bool,
+    data_tx: Sender<DataMessage>,
+    data_rx: Receiver<DataMessage>,
     status: String,
     clipboard: String,
 }
 
+enum DataMessage {
+    Network(Vec<NetworkRow>),
+    Services(Vec<ServiceRow>),
+    Logs(Vec<LogRow>),
+}
+
 impl App {
     fn new() -> Self {
-        let mut system = System::new_all();
-        system.refresh_all();
+        let mut system = System::new();
+        system.refresh_cpu_all();
+        system.refresh_memory();
         let disks = Disks::new_with_refreshed_list();
+        let (data_tx, data_rx) = mpsc::channel();
 
-        let mut app = Self {
+        Self {
             system,
             disks,
             network: Vec::new(),
             processes: Vec::new(),
-            services: Vec::new(),
-            logs: Vec::new(),
+            services: loading_services(),
+            logs: loading_logs(),
             files: Vec::new(),
             view: View::Dashboard,
             focus: Focus::Tabs,
@@ -275,16 +292,21 @@ impl App {
             prompt_text: String::new(),
             search: String::new(),
             last_refresh: Instant::now(),
-            status: String::new(),
+            last_network_refresh: Instant::now(),
+            initial_load_started: false,
+            network_loading: false,
+            data_tx,
+            data_rx,
+            status: "Loading live data...".to_string(),
             clipboard: String::new(),
-        };
-        app.refresh();
-        app
+        }
     }
 
     fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         loop {
+            self.drain_data_messages();
             terminal.draw(|frame| self.render(frame))?;
+            self.start_initial_load();
 
             if event::poll(Duration::from_millis(200))? {
                 if let Event::Key(key) = event::read()? {
@@ -294,8 +316,14 @@ impl App {
                 }
             }
 
-            if self.modal.is_none() && self.last_refresh.elapsed() >= Duration::from_secs(3) {
+            if self.modal.is_none() && self.last_refresh.elapsed() >= LIVE_REFRESH_INTERVAL {
                 self.refresh_live_data();
+            }
+            if self.modal.is_none()
+                && !self.network_loading
+                && self.last_network_refresh.elapsed() >= NETWORK_REFRESH_INTERVAL
+            {
+                self.refresh_network_async();
             }
         }
         Ok(())
@@ -558,8 +586,11 @@ impl App {
         if self.disk_path.is_some() {
             self.refresh_files();
         }
-        self.services = read_services();
-        self.logs = read_logs();
+        self.services = loading_services();
+        self.logs = loading_logs();
+        self.refresh_services_async();
+        self.refresh_logs_async();
+        self.refresh_network_async();
         self.refresh_live_data();
     }
 
@@ -567,7 +598,6 @@ impl App {
         self.system.refresh_cpu_all();
         self.system.refresh_memory();
         self.system.refresh_processes(ProcessesToUpdate::All, true);
-        self.network = read_network_connections();
         self.processes = read_processes(&self.system);
         self.last_refresh = Instant::now();
         self.status = format!(
@@ -582,6 +612,72 @@ impl App {
             }
         );
         self.clamp_selection();
+    }
+
+    fn start_initial_load(&mut self) {
+        if self.initial_load_started {
+            return;
+        }
+        self.initial_load_started = true;
+        self.refresh_live_data();
+        self.refresh_network_async();
+        self.refresh_services_async();
+        self.refresh_logs_async();
+    }
+
+    fn drain_data_messages(&mut self) {
+        while let Ok(message) = self.data_rx.try_recv() {
+            match message {
+                DataMessage::Network(network) => {
+                    self.network = network;
+                    self.network_loading = false;
+                    self.last_network_refresh = Instant::now();
+                }
+                DataMessage::Services(services) => {
+                    self.services = services;
+                }
+                DataMessage::Logs(logs) => {
+                    self.logs = logs;
+                }
+            }
+            self.status = format!(
+                "{} disks | {} network | {} processes | search: {}",
+                self.disks.len(),
+                self.network.len(),
+                self.processes.len(),
+                if self.search.is_empty() {
+                    "off"
+                } else {
+                    self.search.as_str()
+                }
+            );
+            self.clamp_selection();
+        }
+    }
+
+    fn refresh_network_async(&mut self) {
+        if self.network_loading {
+            return;
+        }
+        self.network_loading = true;
+        let tx = self.data_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(DataMessage::Network(read_network_connections()));
+        });
+    }
+
+    fn refresh_services_async(&self) {
+        let tx = self.data_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(DataMessage::Services(read_services()));
+        });
+    }
+
+    fn refresh_logs_async(&self) {
+        let tx = self.data_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(DataMessage::Logs(read_logs()));
+        });
     }
 
     fn refresh_files(&mut self) {
@@ -1900,6 +1996,21 @@ fn read_processes(system: &System) -> Vec<ProcessRow> {
     processes
 }
 
+fn loading_services() -> Vec<ServiceRow> {
+    vec![ServiceRow {
+        name: "Loading services...".to_string(),
+        state: "-".to_string(),
+        detail: "Service data loads after the first screen is drawn".to_string(),
+        pid: None,
+    }]
+}
+
+fn loading_logs() -> Vec<LogRow> {
+    vec![LogRow {
+        line: "Loading logs...".to_string(),
+    }]
+}
+
 fn read_network_connections() -> Vec<NetworkRow> {
     let lsof_rows = read_lsof_network_connections();
     if !lsof_rows.is_empty() {
@@ -2349,4 +2460,22 @@ fn format_duration(duration: Duration) -> String {
     let hours = (seconds % 86_400) / 3600;
     let minutes = (seconds % 3600) / 60;
     format!("{days}d {hours}h {minutes}m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_new_defers_slow_startup_data() {
+        let app = App::new();
+
+        assert!(app.network.is_empty());
+        assert!(app.processes.is_empty());
+        assert_eq!(app.services.len(), 1);
+        assert_eq!(app.services[0].name, "Loading services...");
+        assert_eq!(app.logs.len(), 1);
+        assert_eq!(app.logs[0].line, "Loading logs...");
+        assert!(app.status.contains("Loading"));
+    }
 }
